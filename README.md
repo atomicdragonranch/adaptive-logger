@@ -1,5 +1,10 @@
 # Adaptive Logger
 
+[![CI](https://github.com/atomicdragonranch/adaptive-logger/actions/workflows/ci.yml/badge.svg)](https://github.com/atomicdragonranch/adaptive-logger/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Java 17+](https://img.shields.io/badge/Java-17%2B-orange.svg)](https://openjdk.org/)
+[![Tests](https://img.shields.io/badge/tests-177%20passing-brightgreen.svg)]()
+
 An adaptive logging library for JVM applications. Wraps SLF4J with dynamic log level management, automatic error-driven escalation, ring buffer debug context capture, rate limiting, sampling, and lazy evaluation.
 
 Designed for high-throughput streaming applications (Apache Flink, Kafka Streams) but works with any SLF4J-based project.
