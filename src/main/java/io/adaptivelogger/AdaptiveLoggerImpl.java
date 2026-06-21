@@ -1,29 +1,22 @@
 package io.adaptivelogger;
 
-import io.adaptivelogger.error.ErrorDetector;
 import io.adaptivelogger.mdc.MDCProvider;
 import io.adaptivelogger.model.LogEvent;
 import io.adaptivelogger.model.LoggingStatistics;
 import io.adaptivelogger.model.MDContext;
 import io.adaptivelogger.ratelimit.RateLimitedLogger;
 import io.adaptivelogger.ratelimit.RateLimiter;
-import io.adaptivelogger.ratelimit.TimeBasedRateLimiter;
-import io.adaptivelogger.sampling.CountBasedSampler;
-import io.adaptivelogger.sampling.FixedRateSampler;
 import io.adaptivelogger.sampling.SampledLogger;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.Marker;
 import org.slf4j.event.Level;
-import org.slf4j.helpers.MessageFormatter;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -60,35 +53,29 @@ import java.util.function.Supplier;
 public class AdaptiveLoggerImpl implements IAdaptiveLogger {
     private final Logger delegate;
     private final String name;
-    private final RingBuffer<LogEvent> debugBuffer;
-    private final AtomicReference<Level> currentLevel;
-    private final ErrorDetector errorDetector;
-    private final MDCProvider mdcProvider;
     private final AdaptiveLoggingConfig config;
-    private final RateLimiter rateLimiter;
+    private final MDCProvider mdcProvider;
 
-    // Sampler caches to avoid creating new instances per call:
-    // Using separate maps with primitive wrappers (Double/Integer) as keys avoids
-    // creating SamplerKey objects on every sample() call in high-throughput scenarios:
-    private final ConcurrentHashMap<Double, FixedRateSampler> fixedRateSamplerCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<Integer, CountBasedSampler> countBasedSamplerCache = new ConcurrentHashMap<>();
+    // Delegates:
+    private final LogLevelController levelController;
+    private final RingBufferManager ringBufferManager;
+    private final RateLimitManager rateLimitManager;
+    private final SamplingManager samplingManager;
 
     // Performance counters:
     private final AtomicInteger logCount = new AtomicInteger(0);
     private final AtomicInteger errorCount = new AtomicInteger(0);
 
-    // Rate limiting for buffer dumps:
-    private final AtomicReference<Instant> lastBufferDump = new AtomicReference<>(Instant.MIN);
-
     public AdaptiveLoggerImpl(String name, AdaptiveLoggingConfig config) {
         this.name = name;
         this.delegate = LoggerFactory.getLogger(name);
         this.config = config;
-        this.debugBuffer = new RingBuffer<>(config.getRingBufferSize());
-        this.currentLevel = new AtomicReference<>(config.getDefaultLevel());
-        this.errorDetector = new ErrorDetector(config.getErrorDetectionConfig());
         this.mdcProvider = new MDCProvider.DefaultMDCProvider();
-        this.rateLimiter = new TimeBasedRateLimiter();
+
+        this.levelController = new LogLevelController(config);
+        this.ringBufferManager = new RingBufferManager(config);
+        this.rateLimitManager = new RateLimitManager();
+        this.samplingManager = new SamplingManager();
     }
 
     // --- Trace Level ---
@@ -127,7 +114,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     public void trace(String format, Object... arguments) {
         LogEvent event = createLogEvent(Level.TRACE, format, arguments, null);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.TRACE)) {
             withMDC(() -> delegate.trace(format, arguments));
@@ -136,7 +123,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     public void trace(String message, Throwable t) {
         LogEvent event = createLogEvent(Level.TRACE, message, null, t);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.TRACE)) {
             withMDC(() -> delegate.trace(message, t));
@@ -170,7 +157,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
     public final void traceLazy(String format, Supplier<?>... argumentSuppliers) {
         // Create lazy event (no evaluation):
         LogEvent event = createLazyLogEvent(Level.TRACE, format, argumentSuppliers, null);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         // Only evaluate if currently logging (uses cached evaluation):
         if (shouldLog(Level.TRACE)) {
@@ -194,7 +181,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     public void debug(String format, Object... arguments) {
         LogEvent event = createLogEvent(Level.DEBUG, format, arguments, null);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.DEBUG)) {
             withMDC(() -> delegate.debug(format, arguments));
@@ -203,7 +190,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     public void debug(String message, Throwable t) {
         LogEvent event = createLogEvent(Level.DEBUG, message, null, t);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.DEBUG)) {
             withMDC(() -> delegate.debug(message, t));
@@ -237,7 +224,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
     public final void debugLazy(String format, Supplier<?>... argumentSuppliers) {
         // Create lazy event (no evaluation):
         LogEvent event = createLazyLogEvent(Level.DEBUG, format, argumentSuppliers, null);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         // Only evaluate if currently logging (uses cached evaluation):
         if (shouldLog(Level.DEBUG)) {
@@ -263,7 +250,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
         LogEvent event = createLogEvent(Level.INFO, format, arguments, null);
 
         if (config.isBufferInfoMessages()) {
-            bufferEvent(event);
+            ringBufferManager.bufferEvent(event);
         }
 
         if (shouldLog(Level.INFO)) {
@@ -275,7 +262,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
         LogEvent event = createLogEvent(Level.INFO, message, null, t);
 
         if (config.isBufferInfoMessages()) {
-            bufferEvent(event);
+            ringBufferManager.bufferEvent(event);
         }
 
         if (shouldLog(Level.INFO)) {
@@ -298,7 +285,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
         LogEvent event = createLazyLogEvent(Level.INFO, format, argumentSuppliers, null);
 
         if (config.isBufferInfoMessages()) {
-            bufferEvent(event);
+            ringBufferManager.bufferEvent(event);
         }
 
         if (shouldLog(Level.INFO)) {
@@ -322,7 +309,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     public void warn(String format, Object... arguments) {
         LogEvent event = createLogEvent(Level.WARN, format, arguments, null);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.WARN)) {
             withMDC(() -> delegate.warn(format, arguments));
@@ -331,7 +318,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     public void warn(String message, Throwable t) {
         LogEvent event = createLogEvent(Level.WARN, message, null, t);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.WARN)) {
             withMDC(() -> delegate.warn(message, t));
@@ -351,7 +338,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
     @SafeVarargs
     public final void warnLazy(String format, Supplier<?>... argumentSuppliers) {
         LogEvent event = createLazyLogEvent(Level.WARN, format, argumentSuppliers, null);
-        bufferEvent(event);
+        ringBufferManager.bufferEvent(event);
 
         if (shouldLog(Level.WARN)) {
             Object[] args = event.getEvaluatedArguments();
@@ -406,19 +393,15 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     // --- Dynamic Level Management ---
     public void setLevel(Level level) {
-        Level previousLevel = currentLevel.getAndSet(level);
-        if (previousLevel != level) {
-            delegate.info("Log level changed from {} to {} for logger: {}",
-                previousLevel, level, name);
-        }
+        levelController.setLevel(level, delegate, name);
     }
 
     public Level getLevel() {
-        return currentLevel.get();
+        return levelController.getLevel();
     }
 
     public void resetLevel() {
-        setLevel(config.getDefaultLevel());
+        levelController.resetLevel(delegate, name);
     }
 
     // --- Level Checks (SLF4J-compatible API) ---
@@ -481,81 +464,27 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
 
     // --- Buffer Management ---
     public void dumpBuffer() {
-        if (debugBuffer.isEmpty()) {
-            return;
-        }
-
-        // Check cooldown to prevent excessive dumps during error storms:
-        // Use CAS loop to avoid race condition where multiple threads pass the check:
-        Instant now = Instant.now();
-
-        // Zero cooldown means no rate limiting (useful for debugging):
-        if (!config.getBufferDumpCooldown().isZero()) {
-            while (true) {
-                Instant lastDump = lastBufferDump.get();
-                Duration timeSinceLastDump = Duration.between(lastDump, now);
-
-                if (timeSinceLastDump.compareTo(config.getBufferDumpCooldown()) < 0) {
-                    // Still in cooldown period, skip this dump:
-                    long secondsRemaining = config.getBufferDumpCooldown().minus(timeSinceLastDump).getSeconds();
-
-                    // Log at WARN if in error state (context may be lost), DEBUG otherwise:
-                    if (errorDetector.isInErrorState()) {
-                        delegate.warn("Buffer dump skipped due to cooldown ({}s remaining) - some debug context may be lost",
-                            secondsRemaining);
-                    } else {
-                        delegate.debug("Buffer dump skipped due to cooldown ({}s remaining)", secondsRemaining);
-                    }
-                    return;
-                }
-
-                // Try to atomically update the last dump time:
-                if (lastBufferDump.compareAndSet(lastDump, now)) {
-                    // Won the race, proceed with dump:
-                    break;
-                }
-                // Lost the race, another thread updated lastBufferDump:
-                // Re-check to see if we're now in cooldown:
-            }
-        } else {
-            // Zero cooldown - update timestamp for consistency if cooldown is later enabled:
-            lastBufferDump.set(now);
-        }
-
-        // Perform the dump:
-        delegate.info("=== Debug Buffer Dump Start (Size: {}) ===", debugBuffer.size());
-        debugBuffer.forEach(event -> {
-            // Log each buffered event at INFO level to ensure visibility:
-            withMDC(event.getMdContext(), () -> {
-                String message = formatMessage(event);
-                if (event.getThrowable() != null) {
-                    delegate.info("[BUFFERED-{}] {}", event.getLevel(), message, event.getThrowable());
-                } else {
-                    delegate.info("[BUFFERED-{}] {}", event.getLevel(), message);
-                }
-            });
-        });
-        delegate.info("=== Debug Buffer Dump End ===");
+        ringBufferManager.dumpBuffer(delegate, levelController.getErrorDetector());
     }
 
     public void clearBuffer() {
-        debugBuffer.clear();
+        ringBufferManager.clearBuffer();
     }
 
     public int getBufferSize() {
-        return debugBuffer.size();
+        return ringBufferManager.getBufferSize();
     }
 
     // --- Statistics ---
     public LoggingStatistics getStatistics() {
         return LoggingStatistics.builder()
             .loggerName(name)
-            .currentLevel(currentLevel.get())
+            .currentLevel(levelController.getLevel())
             .totalLogs(logCount.get())
             .errorCount(errorCount.get())
-            .bufferSize(debugBuffer.size())
-            .bufferCapacity(debugBuffer.capacity())
-            .errorDetectorState(errorDetector.getState())
+            .bufferSize(ringBufferManager.getBufferSize())
+            .bufferCapacity(ringBufferManager.getBufferCapacity())
+            .errorDetectorState(levelController.getErrorDetector().getState())
             .build();
     }
 
@@ -571,150 +500,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return true if the level is enabled for logging
      */
     public boolean shouldLog(Level level) {
-        // When disabled, delegate to underlying logger:
-        if (!config.isEnabled()) {
-            return delegateLevelEnabled(level);
-        }
-        return level.toInt() >= currentLevel.get().toInt();
-    }
-
-    /**
-     * Check if the underlying SLF4J logger has the given level enabled.
-     * Used when adaptive logging is disabled to bypass our level management.
-     */
-    private boolean delegateLevelEnabled(Level level) {
-        switch (level) {
-            case TRACE:
-                return delegate.isTraceEnabled();
-            case DEBUG:
-                return delegate.isDebugEnabled();
-            case INFO:
-                return delegate.isInfoEnabled();
-            case WARN:
-                return delegate.isWarnEnabled();
-            case ERROR:
-                return delegate.isErrorEnabled();
-            default:
-                return true;
-        }
-    }
-
-    private void withMDC(Runnable action) {
-        // Skip MDC wrapping when disabled - just run the action directly:
-        if (!config.isEnabled()) {
-            action.run();
-            return;
-        }
-        withMDC(mdcProvider.getCurrentContext(), action);
-    }
-
-    private void withMDC(MDContext context, Runnable action) {
-        MDContext.apply(context, action);
-    }
-
-    private void bufferEvent(LogEvent event) {
-        // Skip buffering when adaptive logging is disabled:
-        if (!config.isEnabled()) {
-            return;
-        }
-        if (config.isRingBufferEnabled()) {
-            debugBuffer.add(event);
-        }
-    }
-
-    private LogEvent createLogEvent(Level level, String format, Object[] arguments, Throwable throwable) {
-        logCount.incrementAndGet();
-
-        return LogEvent.builder()
-            .timestamp(Instant.now())
-            .level(level)
-            .loggerName(name)
-            .threadName(Thread.currentThread().getName())
-            .format(format)
-            .arguments(arguments)
-            .throwable(throwable)
-            .mdContext(mdcProvider.getCurrentContext())
-            .build();
-    }
-
-    /**
-     * Creates a lazy log event with deferred argument evaluation.
-     * Arguments are stored as Suppliers and only evaluated when needed.
-     *
-     * @param level Log level
-     * @param format Message format
-     * @param argumentSuppliers Suppliers for lazy evaluation
-     * @param throwable Optional exception
-     * @return Lazy LogEvent
-     */
-    private LogEvent createLazyLogEvent(Level level, String format, Supplier<?>[] argumentSuppliers, Throwable throwable) {
-        logCount.incrementAndGet();
-
-        return LogEvent.builder()
-            .timestamp(Instant.now())
-            .level(level)
-            .loggerName(name)
-            .threadName(Thread.currentThread().getName())
-            .format(format)
-            .lazyArguments(argumentSuppliers)
-            .throwable(throwable)
-            .mdContext(mdcProvider.getCurrentContext())
-            .build();
-    }
-
-    private void handleError(Supplier<LogEvent> eventSupplier) {
-        // Skip error detection and escalation when adaptive logging is disabled:
-        if (!config.isEnabled()) {
-            return;
-        }
-
-        errorCount.incrementAndGet();
-        LogEvent event = eventSupplier.get();
-        bufferEvent(event);
-
-        // Record error and check if we should escalate:
-        errorDetector.recordError(event);
-
-        if (errorDetector.shouldEscalate()) {
-            escalateLogging();
-        }
-
-        if (config.isDumpBufferOnError() && errorDetector.isInErrorState()) {
-            dumpBuffer();
-        }
-    }
-
-    private void escalateLogging() {
-        Level escalationLevel = config.getEscalationLevel();
-        if (currentLevel.get().toInt() > escalationLevel.toInt()) {
-            delegate.warn("Escalating log level from {} to {} due to error threshold",
-                currentLevel.get(), escalationLevel);
-            setLevel(escalationLevel);
-
-            // Schedule de-escalation:
-            LogLevelScheduler.scheduleDeescalation(this, config.getEscalationDuration());
-        }
-    }
-
-    private String formatMessage(LogEvent event) {
-        if (event.getFormat() == null) {
-            return "<no message>";
-        }
-
-        // Use getEvaluatedArguments() to handle both eager and lazy evaluation:
-        Object[] args = event.getEvaluatedArguments();
-
-        if (args == null || args.length == 0) {
-            return event.getFormat();
-        }
-
-        // Use SLF4J's MessageFormatter to properly handle {} placeholders and % characters:
-        try {
-            return MessageFormatter.arrayFormat(event.getFormat(), args).getMessage();
-        } catch (Exception e) {
-            // Fallback to original format if formatting fails:
-            return event.getFormat();
-        }
+        return levelController.shouldLog(level, delegate);
     }
 
     // --- Rate Limiting ---
@@ -738,7 +524,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return a RateLimitedLogger for fluent API usage
      */
     public RateLimitedLogger atMostEvery(long duration, TimeUnit unit) {
-        return new RateLimitedLogger(this, Duration.ofMillis(unit.toMillis(duration)), null);
+        return rateLimitManager.atMostEvery(this, duration, unit);
     }
 
     /**
@@ -750,7 +536,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return a RateLimitedLogger for fluent API usage
      */
     public RateLimitedLogger atMostEvery(long duration, TimeUnit unit, String messageKey) {
-        return new RateLimitedLogger(this, Duration.ofMillis(unit.toMillis(duration)), messageKey);
+        return rateLimitManager.atMostEvery(this, duration, unit, messageKey);
     }
 
     // --- Sampling ---
@@ -776,10 +562,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return a SampledLogger for fluent API usage
      */
     public SampledLogger sample(double rate) {
-        // Double autoboxing is unavoidable but cheaper than creating SamplerKey objects:
-        FixedRateSampler sampler = fixedRateSamplerCache.computeIfAbsent(
-                rate, r -> new FixedRateSampler(r));
-        return new SampledLogger(this, sampler, null);
+        return samplingManager.sample(this, rate);
     }
 
     /**
@@ -790,9 +573,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return a SampledLogger for fluent API usage
      */
     public SampledLogger sample(double rate, String messageKey) {
-        FixedRateSampler sampler = fixedRateSamplerCache.computeIfAbsent(
-                rate, r -> new FixedRateSampler(r));
-        return new SampledLogger(this, sampler, messageKey);
+        return samplingManager.sample(this, rate, messageKey);
     }
 
     /**
@@ -816,10 +597,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return a SampledLogger for fluent API usage
      */
     public SampledLogger sampleEvery(int n) {
-        // Integer autoboxing is unavoidable but cheaper than creating SamplerKey objects:
-        CountBasedSampler sampler = countBasedSamplerCache.computeIfAbsent(
-                n, interval -> new CountBasedSampler(interval));
-        return new SampledLogger(this, sampler, null);
+        return samplingManager.sampleEvery(this, n);
     }
 
     /**
@@ -830,9 +608,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return a SampledLogger for fluent API usage
      */
     public SampledLogger sampleEvery(int n, String messageKey) {
-        CountBasedSampler sampler = countBasedSamplerCache.computeIfAbsent(
-                n, interval -> new CountBasedSampler(interval));
-        return new SampledLogger(this, sampler, messageKey);
+        return samplingManager.sampleEvery(this, n, messageKey);
     }
 
     /**
@@ -845,7 +621,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return true if the message should be logged
      */
     public boolean shouldLogWithRateLimit(Level level, String key, Duration window) {
-        return shouldLog(level) && rateLimiter.shouldLog(key, window);
+        return rateLimitManager.shouldLogWithRateLimit(level, key, window, shouldLog(level));
     }
 
     /**
@@ -855,7 +631,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return the rate limiter instance
      */
     public RateLimiter getRateLimiter() {
-        return rateLimiter;
+        return rateLimitManager.getRateLimiter();
     }
 
     /**
@@ -946,7 +722,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return summary of rate limiting activity
      */
     public String getRateLimitingSummary(boolean resetCounts) {
-        return rateLimiter.getSuppressedSummary(resetCounts);
+        return rateLimitManager.getSummary(resetCounts);
     }
 
     /**
@@ -956,7 +732,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return total number of suppressed messages
      */
     public long getRateLimitingTotalSuppressedCount() {
-        return rateLimiter.getTotalSuppressedCount();
+        return rateLimitManager.getTotalSuppressedCount();
     }
 
     /**
@@ -966,7 +742,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return number of tracked keys
      */
     public int getRateLimitingTrackedKeyCount() {
-        return rateLimiter.getTrackedKeyCount();
+        return rateLimitManager.getTrackedKeyCount();
     }
 
     // --- Sampling Metrics ---
@@ -978,14 +754,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return total number of sampled-out messages
      */
     public long getSamplingTotalSuppressedCount() {
-        long total = 0;
-        for (FixedRateSampler sampler : fixedRateSamplerCache.values()) {
-            total += sampler.getTotalSuppressedCount();
-        }
-        for (CountBasedSampler sampler : countBasedSamplerCache.values()) {
-            total += sampler.getTotalSuppressedCount();
-        }
-        return total;
+        return samplingManager.getTotalSuppressedCount();
     }
 
     /**
@@ -995,14 +764,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return total number of tracked keys
      */
     public int getSamplingTrackedKeyCount() {
-        int total = 0;
-        for (FixedRateSampler sampler : fixedRateSamplerCache.values()) {
-            total += sampler.getTrackedKeyCount();
-        }
-        for (CountBasedSampler sampler : countBasedSamplerCache.values()) {
-            total += sampler.getTrackedKeyCount();
-        }
-        return total;
+        return samplingManager.getTrackedKeyCount();
     }
 
     /**
@@ -1012,35 +774,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return summary of sampling activity
      */
     public String getSamplingSummary(boolean resetCounts) {
-        if (fixedRateSamplerCache.isEmpty() && countBasedSamplerCache.isEmpty()) {
-            return "No sampling activity";
-        }
-
-        StringBuilder summary = new StringBuilder();
-
-        // Process fixed-rate samplers:
-        fixedRateSamplerCache.forEach((rate, sampler) -> {
-            String samplerSummary = sampler.getSuppressedSummary(resetCounts);
-            if (!samplerSummary.equals("No messages sampled out")) {
-                if (summary.length() > 0) {
-                    summary.append("; ");
-                }
-                summary.append("sample(").append(rate).append("): ").append(samplerSummary);
-            }
-        });
-
-        // Process count-based samplers:
-        countBasedSamplerCache.forEach((interval, sampler) -> {
-            String samplerSummary = sampler.getSuppressedSummary(resetCounts);
-            if (!samplerSummary.equals("No messages sampled out")) {
-                if (summary.length() > 0) {
-                    summary.append("; ");
-                }
-                summary.append("sampleEvery(").append(interval).append("): ").append(samplerSummary);
-            }
-        });
-
-        return summary.length() > 0 ? summary.toString() : "No messages sampled out";
+        return samplingManager.getSummary(resetCounts);
     }
 
     /**
@@ -1059,14 +793,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return total number of entries removed
      */
     public int cleanupSamplers(long maxAgeMillis) {
-        int totalRemoved = 0;
-        for (FixedRateSampler sampler : fixedRateSamplerCache.values()) {
-            totalRemoved += sampler.cleanup(maxAgeMillis);
-        }
-        for (CountBasedSampler sampler : countBasedSamplerCache.values()) {
-            totalRemoved += sampler.cleanup(maxAgeMillis);
-        }
-        return totalRemoved;
+        return samplingManager.cleanupSamplers(maxAgeMillis);
     }
 
     /**
@@ -1087,13 +814,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return total number of cached samplers that were cleared
      */
     public int clearSamplerCaches() {
-        int fixedRateCount = fixedRateSamplerCache.size();
-        int countBasedCount = countBasedSamplerCache.size();
-
-        fixedRateSamplerCache.clear();
-        countBasedSamplerCache.clear();
-
-        return fixedRateCount + countBasedCount;
+        return samplingManager.clearSamplerCaches();
     }
 
     /**
@@ -1103,7 +824,7 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
      * @return total number of cached samplers (fixed-rate + count-based)
      */
     public int getCachedSamplerCount() {
-        return fixedRateSamplerCache.size() + countBasedSamplerCache.size();
+        return samplingManager.getCachedSamplerCount();
     }
 
     // --- SLF4J Delegation Methods ---
@@ -1310,4 +1031,56 @@ public class AdaptiveLoggerImpl implements IAdaptiveLogger {
         withMDC(() -> delegate.error(marker, msg, t));
     }
 
+    // --- Private Helper Methods ---
+
+    private void withMDC(Runnable action) {
+        // Skip MDC wrapping when disabled - just run the action directly:
+        if (!config.isEnabled()) {
+            action.run();
+            return;
+        }
+        MDContext.apply(mdcProvider.getCurrentContext(), action);
+    }
+
+    private LogEvent createLogEvent(Level level, String format, Object[] arguments, Throwable throwable) {
+        logCount.incrementAndGet();
+
+        return LogEvent.builder()
+            .timestamp(Instant.now())
+            .level(level)
+            .loggerName(name)
+            .threadName(Thread.currentThread().getName())
+            .format(format)
+            .arguments(arguments)
+            .throwable(throwable)
+            .mdContext(mdcProvider.getCurrentContext())
+            .build();
+    }
+
+    private LogEvent createLazyLogEvent(Level level, String format, Supplier<?>[] argumentSuppliers, Throwable throwable) {
+        logCount.incrementAndGet();
+
+        return LogEvent.builder()
+            .timestamp(Instant.now())
+            .level(level)
+            .loggerName(name)
+            .threadName(Thread.currentThread().getName())
+            .format(format)
+            .lazyArguments(argumentSuppliers)
+            .throwable(throwable)
+            .mdContext(mdcProvider.getCurrentContext())
+            .build();
+    }
+
+    private void handleError(Supplier<LogEvent> eventSupplier) {
+        errorCount.incrementAndGet();
+        levelController.handleError(
+            eventSupplier,
+            ringBufferManager::bufferEvent,
+            this::dumpBuffer,
+            delegate,
+            name,
+            this
+        );
+    }
 }
